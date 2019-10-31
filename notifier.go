@@ -2,11 +2,10 @@ package gobrake
 
 import (
 	"bytes"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -16,6 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+const notifierName = "gobrake"
+const notifierVersion = "4.0.2"
+const userAgent = notifierName + "/" + notifierVersion
 
 const waitTimeout = 5 * time.Second
 
@@ -41,19 +44,6 @@ var (
 func defaultHTTPClient() *http.Client {
 	httpClientOnce.Do(func() {
 		httpClient = &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				Dial: (&net.Dialer{
-					Timeout:   15 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).Dial,
-				TLSHandshakeTimeout: 10 * time.Second,
-				TLSClientConfig: &tls.Config{
-					ClientSessionCache: tls.NewLRUClientSessionCache(1024),
-				},
-				MaxIdleConnsPerHost:   10,
-				ResponseHeaderTimeout: 10 * time.Second,
-			},
 			Timeout: 10 * time.Second,
 		}
 	})
@@ -110,6 +100,53 @@ func (opt *NotifierOptions) init() {
 	}
 }
 
+type routes struct {
+	filters []routeFilter
+
+	stats      *routeStats
+	breakdowns *routeBreakdowns
+}
+
+func newRoutes(opt *NotifierOptions) *routes {
+	return &routes{
+		stats:      newRouteStats(opt),
+		breakdowns: newRouteBreakdowns(opt),
+	}
+}
+
+// AddFilter adds filter that can change route stat or ignore it by returning nil.
+func (rs *routes) AddFilter(fn func(*RouteMetric) *RouteMetric) {
+	rs.filters = append(rs.filters, fn)
+}
+
+func (rs *routes) Flush() {
+	rs.stats.Flush()
+	rs.breakdowns.Flush()
+}
+
+func (rs *routes) Notify(c context.Context, metric *RouteMetric) error {
+	metric.finish()
+
+	for _, fn := range rs.filters {
+		metric = fn(metric)
+		if metric == nil {
+			return nil
+		}
+	}
+
+	err := rs.stats.Notify(c, metric)
+	if err != nil {
+		return err
+	}
+
+	err = rs.breakdowns.Notify(c, metric)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type Notifier struct {
 	opt             *NotifierOptions
 	createNoticeURL string
@@ -120,7 +157,9 @@ type Notifier struct {
 	limit    chan struct{}
 	wg       sync.WaitGroup
 
-	routes *routeStats
+	Routes  *routes
+	Queries *queryStats
+	Queues  *queueStats
 
 	rateLimitReset uint32 // atomic
 	_closed        uint32 // atomic
@@ -136,12 +175,15 @@ func NewNotifierWithOptions(opt *NotifierOptions) *Notifier {
 
 		limit: make(chan struct{}, 2*runtime.NumCPU()),
 
-		routes: newRouteStats(opt),
+		Routes:  newRoutes(opt),
+		Queries: newQueryStats(opt),
+		Queues:  newQueueStats(opt),
 	}
 
 	n.AddFilter(newNotifierFilter(n))
 	n.AddFilter(gopathFilter)
 	n.AddFilter(gitFilter)
+	n.AddFilter(httpUnsolicitedResponseFilter)
 
 	if len(opt.KeysBlacklist) > 0 {
 		n.AddFilter(NewBlacklistKeysFilter(opt.KeysBlacklist...))
@@ -171,7 +213,7 @@ func (n *Notifier) Notify(e interface{}, req *http.Request) {
 // Notice returns Aibrake notice created from error and request. depth
 // determines which call frame to use when constructing backtrace.
 func (n *Notifier) Notice(err interface{}, req *http.Request, depth int) *Notice {
-	return NewNotice(err, req, depth+3)
+	return NewNotice(err, req, depth+1)
 }
 
 type sendResponse struct {
@@ -219,6 +261,7 @@ func (n *Notifier) sendNotice(notice *Notice) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+n.opt.ProjectKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := n.opt.HTTPClient.Do(req)
 	if err != nil {
 		return "", err
@@ -252,6 +295,8 @@ func (n *Notifier) sendNotice(notice *Notice) (string, error) {
 		return "", errIPRateLimited
 	case httpEnhanceYourCalm:
 		return "", errAccountRateLimited
+	case http.StatusRequestEntityTooLarge:
+		return "", errNoticeTooBig
 	}
 
 	err = fmt.Errorf("got unexpected response status=%q", resp.Status)
@@ -290,7 +335,7 @@ func (n *Notifier) SendNoticeAsync(notice *Notice) {
 // with defer statement.
 func (n *Notifier) NotifyOnPanic() {
 	if v := recover(); v != nil {
-		notice := n.Notice(v, nil, 3)
+		notice := n.Notice(v, nil, 2)
 		notice.Context["severity"] = "critical"
 		_, err := n.SendNotice(notice)
 		if err != nil {
@@ -303,7 +348,7 @@ func (n *Notifier) NotifyOnPanic() {
 
 // Flush waits for pending requests to finish.
 func (n *Notifier) Flush() {
-	n.waitTimeout(waitTimeout)
+	_ = n.waitTimeout(waitTimeout)
 }
 
 func (n *Notifier) Close() error {
@@ -335,9 +380,4 @@ func (n *Notifier) waitTimeout(timeout time.Duration) error {
 	case <-time.After(timeout):
 		return fmt.Errorf("Wait timed out after %s", timeout)
 	}
-}
-
-// NotifyRequest notifies Airbrake about the request.
-func (n *Notifier) NotifyRequest(req *RequestInfo) error {
-	return n.routes.NotifyRequest(req)
 }

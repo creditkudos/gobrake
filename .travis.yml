@@ -2,19 +2,18 @@ sudo: false
 language: go
 
 go:
-  - 1.9.x
-  - 1.10.x
   - 1.11.x
+  - 1.12.x
   - tip
 
 matrix:
   allow_failures:
     - go: tip
 
-install:
-  - go get github.com/onsi/ginkgo
-  - go get github.com/onsi/gomega
-  - go get github.com/pkg/errors
-  - go get -u github.com/caio/go-tdigest
-  - go get -u github.com/gin-gonic/gin
-  - go get -u github.com/astaxie/beego
+env:
+  - GO111MODULE=on
+
+go_import_path: github.com/airbrake/gobrake
+
+before_install:
+  - curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s -- -b $(go env GOPATH)/bin v1.17.1

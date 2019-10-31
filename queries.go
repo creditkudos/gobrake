@@ -10,25 +10,33 @@ import (
 	"time"
 )
 
-const flushPeriod = 15 * time.Second
-
-type routeKey struct {
-	Method     string    `json:"method"`
-	Route      string    `json:"route"`
-	StatusCode int       `json:"statusCode"`
-	Time       time.Time `json:"time"`
+type QueryInfo struct {
+	Method    string
+	Route     string
+	Query     string
+	Func      string
+	File      string
+	Line      int
+	StartTime time.Time
+	EndTime   time.Time
 }
 
-type routeKeyStat struct {
-	routeKey
+type queryKey struct {
+	Method string    `json:"method"`
+	Route  string    `json:"route"`
+	Query  string    `json:"query"`
+	Func   string    `json:"function"`
+	File   string    `json:"file"`
+	Line   int       `json:"line"`
+	Time   time.Time `json:"time"`
+}
+
+type queryKeyStat struct {
+	queryKey
 	*tdigestStat
 }
 
-type routeFilter func(*RouteMetric) *RouteMetric
-
-// routeStats aggregates information about requests and periodically sends
-// collected data to Airbrake.
-type routeStats struct {
+type queryStats struct {
 	opt    *NotifierOptions
 	apiURL string
 
@@ -36,27 +44,26 @@ type routeStats struct {
 	addWG      *sync.WaitGroup
 
 	mu sync.Mutex
-	m  map[routeKey]*tdigestStat
+	m  map[queryKey]*tdigestStat
 }
 
-func newRouteStats(opt *NotifierOptions) *routeStats {
-	return &routeStats{
+func newQueryStats(opt *NotifierOptions) *queryStats {
+	return &queryStats{
 		opt: opt,
-		apiURL: fmt.Sprintf("%s/api/v5/projects/%d/routes-stats",
+		apiURL: fmt.Sprintf("%s/api/v5/projects/%d/queries-stats",
 			opt.Host, opt.ProjectId),
 	}
 }
 
-func (s *routeStats) init() {
+func (s *queryStats) init() {
 	if s.flushTimer == nil {
-		s.flushTimer = time.AfterFunc(flushPeriod, s.Flush)
+		s.flushTimer = time.AfterFunc(flushPeriod, s.flush)
 		s.addWG = new(sync.WaitGroup)
-		s.m = make(map[routeKey]*tdigestStat)
+		s.m = make(map[queryKey]*tdigestStat)
 	}
 }
 
-// Flush sends to Airbrake route stats.
-func (s *routeStats) Flush() {
+func (s *queryStats) flush() {
 	s.mu.Lock()
 
 	s.flushTimer = nil
@@ -67,32 +74,28 @@ func (s *routeStats) Flush() {
 
 	s.mu.Unlock()
 
-	if m == nil {
-		return
-	}
-
 	addWG.Wait()
 	err := s.send(m)
 	if err != nil {
-		logger.Printf("routeStats.send failed: %s", err)
+		logger.Printf("queryStats.send failed: %s", err)
 	}
 }
 
-type routesOut struct {
-	Env    string         `json:"environment"`
-	Routes []routeKeyStat `json:"routes"`
+type queriesOut struct {
+	Env     string         `json:"environment"`
+	Queries []queryKeyStat `json:"queries"`
 }
 
-func (s *routeStats) send(m map[routeKey]*tdigestStat) error {
-	var routes []routeKeyStat
+func (s *queryStats) send(m map[queryKey]*tdigestStat) error {
+	var queries []queryKeyStat
 	for k, v := range m {
 		err := v.Pack()
 		if err != nil {
 			return err
 		}
 
-		routes = append(routes, routeKeyStat{
-			routeKey:    k,
+		queries = append(queries, queryKeyStat{
+			queryKey:    k,
 			tdigestStat: v,
 		})
 	}
@@ -101,11 +104,11 @@ func (s *routeStats) send(m map[routeKey]*tdigestStat) error {
 	defer buffers.Put(buf)
 	buf.Reset()
 
-	out := routesOut{
-		Env:    s.opt.Environment,
-		Routes: routes,
+	out := queriesOut{
+		Env:     s.opt.Environment,
+		Queries: queries,
 	}
-	err := json.NewEncoder(buf).Encode(out)
+	err := json.NewEncoder(buf).Encode(&out)
 	if err != nil {
 		return err
 	}
@@ -145,13 +148,15 @@ func (s *routeStats) send(m map[routeKey]*tdigestStat) error {
 	return err
 }
 
-// Notify adds new route stats.
-func (s *routeStats) Notify(c context.Context, req *RouteMetric) error {
-	key := routeKey{
-		Method:     req.Method,
-		Route:      req.Route,
-		StatusCode: req.StatusCode,
-		Time:       req.startTime.UTC().Truncate(time.Minute),
+func (s *queryStats) Notify(c context.Context, q *QueryInfo) error {
+	key := queryKey{
+		Method: q.Method,
+		Route:  q.Route,
+		Query:  q.Query,
+		Func:   q.Func,
+		File:   q.File,
+		Line:   q.Line,
+		Time:   q.StartTime.UTC().Truncate(time.Minute),
 	}
 
 	s.mu.Lock()
@@ -162,10 +167,10 @@ func (s *routeStats) Notify(c context.Context, req *RouteMetric) error {
 		s.m[key] = stat
 	}
 	addWG := s.addWG
-	addWG.Add(1)
+	s.addWG.Add(1)
 	s.mu.Unlock()
 
-	dur := req.endTime.Sub(req.startTime)
+	dur := q.EndTime.Sub(q.StartTime)
 	err := stat.Add(dur)
 	addWG.Done()
 

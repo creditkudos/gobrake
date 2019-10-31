@@ -12,11 +12,11 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/airbrake/gobrake"
-	"github.com/airbrake/gobrake/internal/testpkg1"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	"github.com/airbrake/gobrake/v4"
+	"github.com/airbrake/gobrake/v4/internal/testpkg1"
 )
 
 func TestGobrake(t *testing.T) {
@@ -48,7 +48,8 @@ var _ = Describe("Notifier", func() {
 			Expect(err).To(BeNil())
 
 			w.WriteHeader(http.StatusCreated)
-			w.Write([]byte(`{"id":"123"}`))
+			_, err = w.Write([]byte(`{"id":"123"}`))
+			Expect(err).To(BeNil())
 		}
 		server := httptest.NewServer(http.HandlerFunc(handler))
 
@@ -101,7 +102,7 @@ var _ = Describe("Notifier", func() {
 		frame := e.Backtrace[0]
 		Expect(frame.File).To(Equal("/GOPATH/github.com/airbrake/gobrake/notifier_test.go"))
 		Expect(frame.Line).To(Equal(33))
-		Expect(frame.Func).To(Equal("glob..func1.1"))
+		Expect(frame.Func).To(ContainSubstring("glob..func"))
 		Expect(frame.Code[33]).To(Equal("\t\tnotifier.Notify(e, req)"))
 	})
 
@@ -164,6 +165,10 @@ var _ = Describe("Notifier", func() {
 		Expect(sendNoticeReq.Header.Get("Authorization")).To(Equal("Bearer key"))
 	})
 
+	It("sets user agent", func() {
+		Expect(sendNoticeReq.Header.Get("User-Agent")).To(ContainSubstring("gobrake/"))
+	})
+
 	It("reports context using SetContext", func() {
 		notifier.AddFilter(func(notice *gobrake.Notice) *gobrake.Notice {
 			notice.Context["environment"] = "production"
@@ -219,7 +224,7 @@ var _ = Describe("Notifier", func() {
 		Expect(sentNotice.Context["hostname"]).To(Equal(hostname))
 		Expect(sentNotice.Context["rootDirectory"]).To(Equal(wd))
 		Expect(sentNotice.Context["gopath"]).To(Equal(gopath))
-		Expect(sentNotice.Context["component"]).To(Equal("github.com/airbrake/gobrake_test"))
+		Expect(sentNotice.Context["component"]).To(Equal("github.com/airbrake/gobrake/v4_test"))
 		Expect(sentNotice.Context["repository"]).To(Equal("https://github.com/airbrake/gobrake"))
 		Expect(sentNotice.Context["revision"]).NotTo(BeEmpty())
 		Expect(sentNotice.Context["lastCheckout"]).NotTo(BeEmpty())
@@ -237,6 +242,15 @@ var _ = Describe("Notifier", func() {
 
 		notify(notice, nil)
 		Expect(sentNotice.Context["severity"]).To(Equal(customSeverity))
+	})
+
+	It("filters errors with message that starts with '(string)Unsolicited response received on idle HTTP channel starting with", func() {
+		sentNotice = nil
+
+		msg := "Unsolicited response received on idle HTTP channel starting with HTTP/1.0 408 Request Time-out"
+		notify(msg, nil)
+
+		Expect(sentNotice).To(BeNil())
 	})
 })
 
@@ -303,5 +317,78 @@ var _ = Describe("Notice exceeds 64KB", func() {
 		notice := notifier.Notice(string(b), nil, 3)
 		_, err = notifier.SendNotice(notice)
 		Expect(err).To(MatchError("gobrake: notice exceeds 64KB max size limit"))
+	})
+})
+
+var _ = Describe("Notifier request filter", func() {
+	type routeStat struct {
+		Method     string
+		Route      string
+		StatusCode int
+		Count      int     `json:"count"`
+		Sum        float64 `json:"sum"`
+		Sumsq      float64 `json:"sumsq"`
+		TDigest    []byte  `json:"tdigest"`
+	}
+
+	type routeStats struct {
+		Routes []routeStat `json:"routes"`
+	}
+
+	var notifier *gobrake.Notifier
+	var stats *routeStats
+
+	BeforeEach(func() {
+		stats = new(routeStats)
+
+		handler := func(w http.ResponseWriter, req *http.Request) {
+			b, err := ioutil.ReadAll(req.Body)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = json.Unmarshal(b, &stats)
+			Expect(err).NotTo(HaveOccurred())
+
+			w.WriteHeader(http.StatusCreated)
+		}
+		server := httptest.NewServer(http.HandlerFunc(handler))
+
+		notifier = gobrake.NewNotifierWithOptions(&gobrake.NotifierOptions{
+			ProjectId:  1,
+			ProjectKey: "key",
+			Host:       server.URL,
+		})
+
+		notifier.Routes.AddFilter(func(info *gobrake.RouteMetric) *gobrake.RouteMetric {
+			if info.Route == "/pong" {
+				return nil
+			}
+			return info
+		})
+	})
+
+	It("sends route stat with route is /ping", func() {
+		_, metric := gobrake.NewRouteMetric(nil, "GET", "/ping")
+		metric.StatusCode = http.StatusOK
+		err := notifier.Routes.Notify(nil, metric)
+		Expect(err).NotTo(HaveOccurred())
+
+		notifier.Routes.Flush()
+		Expect(stats.Routes).To(HaveLen(1))
+
+		route := stats.Routes[0]
+		Expect(route.Method).To(Equal("GET"))
+		Expect(route.Route).To(Equal("/ping"))
+		Expect(route.StatusCode).To(Equal(200))
+		Expect(route.Count).To(Equal(1))
+	})
+
+	It("ignores route stat with route is /pong", func() {
+		_, metric := gobrake.NewRouteMetric(nil, "GET", "/pong")
+		metric.StatusCode = http.StatusOK
+		err := notifier.Routes.Notify(nil, metric)
+		Expect(err).NotTo(HaveOccurred())
+
+		notifier.Routes.Flush()
+		Expect(stats.Routes).To(HaveLen(0))
 	})
 })

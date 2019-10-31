@@ -1,44 +1,41 @@
 package beego
 
 import (
-	"time"
+	goctx "context"
 
-	"github.com/airbrake/gobrake"
+	"github.com/airbrake/gobrake/v4"
 
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/context"
 )
 
-func beforeExecFunc() func(c *context.Context) {
-	return func(c *context.Context) {
-		c.Input.SetData("StartTime", time.Now())
-	}
-}
+const abMetricKey = "ab_metric"
 
-func afterExecFunc(notifier *gobrake.Notifier) func(c *context.Context) {
+func beforeExecFunc() func(c *context.Context) {
 	return func(c *context.Context) {
 		routerPattern, ok := c.Input.GetData("RouterPattern").(string)
 		if !ok {
 			return
 		}
 
-		statusCode := c.Output.Status
-		if statusCode == 0 {
-			statusCode = 200
-		}
+		_, metric := gobrake.NewRouteMetric(goctx.TODO(), c.Input.Method(), routerPattern)
+		c.Input.SetData(abMetricKey, metric)
+	}
+}
 
-		startTime, ok := c.Input.GetData("StartTime").(time.Time)
+func afterExecFunc(notifier *gobrake.Notifier) func(c *context.Context) {
+	return func(c *context.Context) {
+		metric, ok := c.Input.GetData(abMetricKey).(*gobrake.RouteMetric)
 		if !ok {
 			return
 		}
 
-		notifier.NotifyRequest(&gobrake.RequestInfo{
-			Method:     c.Input.Method(),
-			Route:      routerPattern,
-			StatusCode: statusCode,
-			Start:      startTime,
-			End:        time.Now(),
-		})
+		metric.StatusCode = c.Output.Status
+		if metric.StatusCode == 0 {
+			metric.StatusCode = 200
+		}
+
+		_ = notifier.Routes.Notify(goctx.TODO(), metric)
 	}
 }
 

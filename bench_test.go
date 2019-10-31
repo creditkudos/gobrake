@@ -6,9 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/airbrake/gobrake"
+	"github.com/airbrake/gobrake/v4"
 )
 
 func BenchmarkSendNotice(b *testing.B) {
@@ -24,11 +23,10 @@ func BenchmarkSendNotice(b *testing.B) {
 		Host:       server.URL,
 	})
 
-	notice := notifier.Notice(errors.New("benchmark"), nil, 0)
-
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
+		notice := notifier.Notice(errors.New("benchmark"), nil, 0)
 		for pb.Next() {
 			id, err := notifier.SendNotice(notice)
 			if err != nil {
@@ -41,34 +39,18 @@ func BenchmarkSendNotice(b *testing.B) {
 	})
 }
 
-func BenchmarkNotifyRequest(b *testing.B) {
+func BenchmarkRoutesNotify(b *testing.B) {
 	notifier := gobrake.NewNotifierWithOptions(&gobrake.NotifierOptions{
 		ProjectId:  1,
 		ProjectKey: "",
 	})
 
-	tm, err := time.Parse(time.RFC3339, "2018-01-01T00:00:00Z")
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	const n = 100
-	reqs := make([]*gobrake.RequestInfo, n)
-	for i := 0; i < n; i++ {
-		reqs[i] = &gobrake.RequestInfo{
-			Method:     "GET",
-			Route:      fmt.Sprintf("/api/v4/groups/%d", i),
-			StatusCode: 200,
-			Start:      tm,
-			End:        tm.Add(123 * time.Millisecond),
-		}
-	}
-
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		var i int
 		for pb.Next() {
-			err := notifier.NotifyRequest(reqs[i%n])
+			_, metric := gobrake.NewRouteMetric(nil, "GET", fmt.Sprintf("/api/v4/groups/%d", i))
+			err := notifier.Routes.Notify(nil, metric)
 			if err != nil {
 				b.Fatal(err)
 			}
